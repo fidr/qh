@@ -6,6 +6,7 @@ defmodule QTest.User do
     field(:name, :string)
     field(:age, :integer)
     field(:nicknames, {:array, :string})
+    has_many :messages, QTest.Message
     timestamps()
   end
 

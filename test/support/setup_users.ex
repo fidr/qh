@@ -1,8 +1,8 @@
-defmodule QTest.Repo.Migrations.SetupTables do
+defmodule QTest.Repo.Migrations.SetupUsers do
   use Ecto.Migration
 
   def change do
-    create table("users") do
+    create table(:users) do
       add(:name, :text)
       add(:age, :integer)
       add(:nicknames, {:array, :text})

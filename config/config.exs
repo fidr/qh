@@ -13,5 +13,6 @@ if Mix.env() == :test do
     hostname: "localhost",
     database: "q_test#{System.get_env("MIX_TEST_PARTITION")}",
     pool: Ecto.Adapters.SQL.Sandbox,
-    pool_size: 10
+    pool_size: 10,
+    ownership_timeout: 24*60*60_000
 end

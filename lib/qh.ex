@@ -23,18 +23,34 @@ defmodule Qh do
     end
   end
 
+  defmacro q(query, opts \\ []) do
+    Qh.query(query, opts, __CALLER__)
+  end
+
+
+  def configure(opts) do
+    Enum.each(opts, fn {k, v} ->
+      Application.put_env(:qh, k, v)
+    end)
+  end
+
   @doc """
   Run a query
 
   Examples:
-      use Qh
 
-      Qh.configure(app: :my_app)
-
+      # First/last
       q User.first
+      q User.first(10)
+      q User.last
+      q User.last(1)
+
+      # Custom order
       q User.order(name).last(3)
       q User.order(name: :asc, age: :desc).last
       q User.order("lower(?)", name).last
+
+      # Conditions
       q User.where(age > 20 and age <= 30).count
       q User.where(age > 20 and age <= 30).limit(10).all
       q User.where(age > 20 or name == "Bob").all
@@ -42,93 +58,156 @@ defmodule Qh do
       q User.where(age: 20, name: "Bob").count
       q User.where("nicknames && ?", ["Bobby", "Bobi"]).count
       q User.where("? = ANY(?)", age, [20, 30, 40]).count
+
+      # Opional binding
+      q User.where([u], u.age > 20 and u.age <= 30).count
+
+      # Find
+      q User.get!(21)
+      # or
       q User.find(21)
+
+      # Alias for where(...).first
       q User.find_by(name: "Bob Foo")
       q User.find_by(name == "Bob" or name == "Anna")
 
-      # Initialize new
-      user = q User.new(name: "Bob")
+      # Aggregations
+      q User.group_by("length(name)").count
+      q User.group_by(name).avg(age)
+
+      # Select stats
+      q User.select(count(), avg(age), min(age), max(age)).all
+
+      # Aggregate stats grouped by column
+      q User.group_by(name).aggr(%{count: count(), avg: avg(age), min: min(age), max: max(age)})
+
+      # Count number of messages per user
+      q User.left_join(:messages).group_by(id).count([u, m], m.id)
+
+      # Grab only users that have messages
+      q User.distinct(id).join(:messages).all
+
+      # Custom join logic
+      q User.join([u], u in MyApp.Messages, on: u.id == m.sent_by_id, as: :m)
+
   """
-  defmacro q(q, opts \\ []) do
+  def query(q, opts \\ [], caller \\ __ENV__) do
     [schema | rest] = unwrap_nested(q)
 
-    code = [
-      quote do
-        require Ecto.Query
-        query = Qh.lookup_schema(unquote(schema), unquote(opts))
+    code =
+      if is_atom(schema) && !first_uppercase?(schema) do
+        quote do
+          require Ecto.Query
+          query = unquote({schema, [if_undefined: :apply], nil})
+        end
+      else
+        quote do
+          require Ecto.Query
+          query = Qh.lookup_schema(unquote(schema), unquote(opts))
+        end
       end
-    ]
+
+    # aliases
+    rest =
+      Enum.flat_map(rest, fn
+        {:order, _, params} ->
+          [{:order_by, [], params}]
+
+        {:find, _, params} ->
+          [{:get, [], params}]
+
+        {:find_by, _, params} ->
+          [{:where, [], params}, {:first, [], []}]
+
+        {fun, _, params} when fun in [:count, :sum, :avg, :min, :max] ->
+          if first_param_binding?(params) do
+            [binding | params] = params
+            [{:aggr, [], [binding, {fun, [], params}]}]
+          else
+            [{:aggr, [], [{fun, [], params}]}]
+          end
+
+        other ->
+          [other]
+      end)
 
     code =
-      code ++
+      [code] ++
         Enum.map(rest, fn
-          {:order, _, [q | _rest] = fragment} when is_binary(q) ->
-            fragment = deep_prefix_binding(fragment)
+          # Ecto.Query functions /3 (with binding)
+          {fun, _, params}
+          when fun in [
+                 :distinct,
+                 :where,
+                 :select,
+                 :select_merge,
+                 :group_by,
+                 :having,
+                 :lock,
+                 :or_having,
+                 :or_where,
+                 :order_by,
+                 :preload,
+                 :windows,
+                 :limit
+               ] ->
+            transform_with_binding(fun, params)
 
+          # Ecto.Query functions /2
+          {fun, _, params}
+          when fun in [
+                 :except,
+                 :except_all,
+                 :exclude,
+                 :intersect,
+                 :intersect_all,
+                 :union,
+                 :union_all
+               ] ->
             quote do
-              query = Ecto.Query.order_by(query, [t], fragment(unquote_splicing(fragment)))
+              query = Ecto.Query.unquote(fun)(query, unquote_splicing(params))
             end
 
-          {:order, _, [order]} ->
-            order =
-              Enum.map(List.wrap(order), fn
-                {_k, _, nil} = part -> deep_prefix_binding(part)
-                {key, dir} -> {dir, deep_prefix_binding(key)}
-              end)
-
+          # Ecto.Query functions /1
+          {fun, _, []}
+          when fun in [
+                 :reverse_order
+               ] ->
             quote do
-              query = Ecto.Query.order_by(query, [t], unquote(order))
+              query = Ecto.Query.unquote(fun)(query)
             end
 
-          {:where, _, [q | _rest] = fragment} when is_binary(q) ->
-            fragment = deep_prefix_binding(fragment)
-
+          # Repo functions /1
+          {fun, _, []} when fun in [:all, :one, :stream, :exists?] ->
             quote do
-              query = Ecto.Query.where(query, [t], fragment(unquote_splicing(fragment)))
+              Qh.repo(unquote(opts)).unquote(fun)(query)
             end
 
-          {:where, _, [conditions]} ->
-            conditions = deep_prefix_binding(conditions)
+          # Quick or custom join
+          {join, _, params}
+          when join in [
+                 :join,
+                 :inner_join,
+                 :left_join,
+                 :right_join,
+                 :cross_join,
+                 :full_join,
+                 :inner_lateral_join,
+                 :left_lateral_join
+               ] ->
+            transform_join(join, params)
 
+          # Aggregrate respecting group_bys
+          {:aggr, _, params} ->
+            transform_aggr(params, caller, opts)
+
+          # Return a queryable
+          {:query, _, []} ->
             quote do
-              query = Ecto.Query.where(query, [t], unquote(conditions))
+              query = Ecto.Queryable.to_query(query)
             end
 
-          {:limit, _, [n]} ->
-            quote do
-              query = Ecto.Query.limit(query, unquote(n))
-            end
-
-          {:find, _, [id]} ->
-            quote do
-              Qh.repo(unquote(opts)).get!(query, unquote(id))
-            end
-
-          {:find_by, _, [q | _rest] = fragment} when is_binary(q) ->
-            fragment = deep_prefix_binding(fragment)
-
-            quote do
-              Ecto.Query.where(query, [t], fragment(unquote_splicing(fragment)))
-              |> Ecto.Query.limit(1)
-              |> Qh.repo(unquote(opts)).all()
-              |> List.first()
-            end
-
-          {:find_by, _, [condition]} ->
-            condition = deep_prefix_binding(condition)
-
-            quote do
-              Ecto.Query.where(query, [t], unquote(condition))
-              |> Ecto.Query.limit(1)
-              |> Qh.repo(unquote(opts)).all()
-              |> List.first()
-            end
-
-          {:count, _, _} ->
-            quote do
-              Qh.repo(unquote(opts)).aggregate(query, :count)
-            end
-
+          # First/last
           {:first, _, []} ->
             quote do
               Ecto.Query.limit(query, 1)
@@ -160,24 +239,6 @@ defmodule Qh do
               |> Enum.reverse()
             end
 
-          {:select, _, target} ->
-            target =
-              target
-              |> unwrap_single()
-              |> deep_prefix_binding()
-
-            quote do
-              query
-              |> Ecto.Query.select([t], unquote(target))
-              |> Qh.repo(unquote(opts)).all()
-            end
-
-          {:all, _, []} ->
-            quote do
-              query
-              |> Qh.repo(unquote(opts)).all()
-            end
-
           {:new, _, []} ->
             quote do
               schema = Qh.get_schema(query)
@@ -191,216 +252,180 @@ defmodule Qh do
             end
         end)
 
-    quote do
-      (unquote_splicing(code))
+    code =
+      quote do
+        (unquote_splicing(code))
+      end
+
+    #IO.puts(Macro.to_string(code))
+
+    code
+  end
+
+  # Transform
+
+  def transform_join(fun, params) do
+    type =
+      case String.split(to_string(fun), "_", parts: 2) do
+        ["join"] -> :inner
+        [type, "join"] -> String.to_atom(type)
+      end
+
+    case params do
+      [target] when is_atom(target) ->
+        quote do
+          query = Ecto.Query.join(query, unquote(type), [t], assoc(t, unquote(target)))
+        end
+
+      [target, as] when is_atom(target) and is_atom(as) ->
+        quote do
+          query =
+            Ecto.Query.join(query, unquote(type), [t], assoc(t, unquote(target)),
+              as: unquote(as)
+            )
+        end
+
+      [target, {as, _, nil}] when is_atom(target) and is_atom(as) ->
+        quote do
+          query =
+            Ecto.Query.join(query, unquote(type), [t], assoc(t, unquote(target)),
+              as: unquote(as)
+            )
+        end
+
+      params ->
+        {binding_provided, binding, params} = Qh.split_optional_binding(params)
+
+        params = Qh.Expr.maybe_deep_prefix_binding(binding_provided, params)
+
+        quote do
+          query =
+            Ecto.Query.join(
+              query,
+              unquote(type),
+              unquote(binding),
+              unquote_splicing(params)
+            )
+        end
     end
   end
 
-  @doc """
-  Update fields in a struct
+  def transform_aggr(original_params, caller, opts) do
+    {binding_provided, binding, params} = Qh.split_optional_binding(original_params)
 
-  Examples:
+    {_, binding} =
+      Ecto.Query.Builder.escape_binding(quote(do: %Ecto.Query{}), binding, caller)
 
-      user = %MyApp.User{name: nil, age: nil}
-      user = Qh.assign(user, name: "Bob", age: 21)
+    prefixed_params = unwrap_single(params)
 
-      # or initialize a new record
-      user = Qh.assign(:user, name: "Alice", age: 22)
-  """
-  def assign(schema, params, opts \\ [])
+    prefixed_params = Qh.Expr.maybe_deep_prefix_binding(binding_provided, prefixed_params)
 
-  def assign(%_{} = struct, params, _opts) do
-    struct(struct, params)
+    {prefixed_params, _take} =
+      Ecto.Query.Builder.Select.escape(prefixed_params, binding, caller)
+
+    call_select = transform_with_binding(:select, original_params)
+
+    quote do
+      query =
+        if Qh.has_group_by?(query) do
+          query
+          |> Qh.group_by_and_aggregate(unquote(prefixed_params))
+          |> Qh.repo(unquote(opts)).all()
+        else
+          unquote(call_select)
+          |> Qh.repo(unquote(opts)).one()
+        end
+    end
   end
 
-  def assign(schema, params, opts) do
-    struct(Qh.lookup_schema(schema, opts), params)
+  def group_by_and_aggregate(query, target) do
+    {first_group_by, joined_expr} =
+      case query.group_bys do
+        [group_by] ->
+          {group_by, unwrap_single(group_by.expr)}
+
+        [first | _] = list ->
+          {first, Enum.map(list, fn group_by -> unwrap_single(group_by.expr) end)}
+      end
+
+    target = expr_to_funcs(target)
+
+    expr = {:{}, [], [joined_expr, target]}
+
+    select = %Ecto.Query.SelectExpr{
+      expr: expr,
+      file: first_group_by.file,
+      line: first_group_by.line
+    }
+
+    Map.put(query, :select, select)
   end
 
-  @doc """
-  Save a struct to the database
+  def transform_with_binding(fun, params) do
+    {binding_provided, binding, params} = Qh.split_optional_binding(params)
 
-  Inserts a new record if no primary key is set
-  or no record exists with the current primary key.
+    params = replace_fragments(params)
+    params = unwrap_single(params)
+    params = maybe_replace_order(fun, params)
 
-  Performs a get and an update if the record already exists.
+    new_params = Qh.Expr.maybe_deep_prefix_binding(binding_provided, params)
 
-  Returns `{:ok, struct}` on success or `{:error, validation_errors}` on failure.
-
-  Examples:
-      user = %MyApp.User{id: nil, name: "Bob", age: 21}
-      {:ok, user} = Qh.save(user)
-
-  """
-  def save(%schema{} = struct, opts \\ []) do
-    primary_key = schema.__schema__(:primary_key)
-    primary_key_values = Map.take(struct, primary_key)
-    primary_values = Map.values(primary_key_values)
-
-    if Enum.all?(primary_values, &is_nil/1) do
-      # no primary key set, create new new
-      params = Map.from_struct(struct)
-      changeset = schema.changeset(struct(schema), params)
-
-      Qh.repo(opts).insert(changeset)
-      |> handle_repo_result()
+    if !binding_provided and params == new_params do
+      quote do
+        query = Ecto.Query.unquote(fun)(query, unquote(new_params))
+      end
     else
-      case Qh.repo(opts).get_by(schema, primary_key_values) do
-        nil ->
-          # no record found, create new
-          params = Map.from_struct(struct)
-          changeset = schema.changeset(struct(schema), params)
-
-          Qh.repo(opts).insert(changeset)
-          |> handle_repo_result()
-
-        current ->
-          # record found, update
-          params = Map.from_struct(struct)
-          changeset = schema.changeset(current, params)
-
-          Qh.repo(opts).update(changeset)
-          |> handle_repo_result()
+      quote do
+        query = Ecto.Query.unquote(fun)(query, unquote(binding), unquote(new_params))
       end
     end
   end
 
-  @doc """
-  Save a struct to the database
+  defp maybe_replace_order(:order_by, order) do
+    Enum.map(List.wrap(order), fn
+      {key, dir}
+      when dir in [
+             :asc,
+             :asc_nulls_last,
+             :asc_nulls_first,
+             :desc,
+             :desc_nulls_last,
+             :desc_nulls_first
+           ] ->
+        {dir, key}
 
-  Similar to `save/1` but will raise on failures and return only the
-  struct on success.
-
-  Examples:
-      user = %MyApp.User{id: nil, name: "Bob", age: 21}
-      user = Qh.save!(user)
-
-  """
-  def save!(%_schema{} = struct, opts \\ []) do
-    save(struct, opts) |> ok_or_raise()
-  end
-
-  @doc """
-  Performs a database update for a struct and params
-
-  Returns `{:ok, struct}` on success or `{:error, validation_errors}` on failure.
-
-  Examples:
-      user = %MyApp.User{id: 2, name: "Bob", age: 21}
-      {:ok, user} = Qh.update(user, age: 22)
-
-  """
-  def update(%schema{} = struct, params, opts \\ []) do
-    changeset = schema.changeset(struct, Map.new(params))
-
-    Qh.repo(opts).update(changeset)
-    |> handle_repo_result()
-  end
-
-  @doc """
-  Save a struct to the database
-
-  Similar to `update/1` but will raise on failures and return only the
-  struct on success.
-
-  Examples:
-      user = %MyApp.User{id: 2, name: "Bob", age: 21}
-      user = Qh.update!(user, age: 22)
-
-  """
-  def update!(%_schema{} = struct, params, opts \\ []) do
-    update(struct, params, opts) |> ok_or_raise()
-  end
-
-  @doc """
-  Delete a struct in the database
-
-  Will raise if the record doesn't exists
-
-  Examples:
-      user = %MyApp.User{id: 2, name: "Bob", age: 21}
-      Qh.delete!(user)
-
-  """
-  def delete!(%_schema{} = struct, opts \\ []) do
-    Qh.repo(opts).delete!(struct)
-  end
-
-  defp handle_repo_result({:ok, struct}) do
-    {:ok, struct}
-  end
-
-  defp handle_repo_result({:error, changeset}) do
-    {:error, changeset.errors}
-  end
-
-  defp ok_or_raise({:ok, struct}) do
-    struct
-  end
-
-  defp ok_or_raise({:error, error}) do
-    raise inspect(error)
-  end
-
-  defp deep_prefix_binding(tree) do
-    prewalk_cond(tree, fn
-      {:^, _, _} = node ->
-        {false, node}
-
-      {field, _, nil} ->
-         {false, {{:., [], [{:t, [], nil}, field]}, [no_parens: true], []}}
-
-      node ->
-        {true, node}
+      other ->
+        other
     end)
   end
 
-  defp unwrap_single([item]), do: item
-  defp unwrap_single(other), do: other
-
-  defp unwrap_nested({{:., _, [left, right]}, opts, children}) do
-    parens = if opts[:no_parens], do: false, else: true
-
-    unwrap_nested(left) ++ [{right, [parens: parens], children}]
+  defp maybe_replace_order(_fun, params) do
+    params
   end
 
-  defp unwrap_nested({k, _, nil}), do: [k]
-  defp unwrap_nested(v), do: [v]
+  defp replace_fragments(list) do
+    case list do
+      [q | _] when is_binary(q) ->
+        quote do: fragment(unquote_splicing(list))
 
-  def repo(opts \\ []) do
-    repo_mod(opts)
-  end
-
-  def lookup_schema(schema, opts \\ []) do
-    app_mod = app_mod(opts)
-
-    cond do
-      is_atom(schema) and first_uppercase?(schema) and ensure_compiled?(schema) ->
-        schema
-
-      first_uppercase?(schema) ->
-        module = Module.concat(app_mod, schema)
-        module_or_raise!(module, schema)
-
-      true ->
-        module = Module.concat(app_mod, Macro.camelize(to_string(schema)))
-        module_or_raise!(module, schema)
+      list ->
+        list
     end
   end
 
-  def repo_mod(opts) do
-    opts[:repo] || Application.get_env(:qh, :repo) || Module.concat(app_mod(opts), Repo)
+  defp expr_to_funcs(expr) do
+    case expr do
+      list when is_list(list) -> Enum.map(list, fn sub_expr -> expr_to_funcs(sub_expr) end)
+      {fun, arg} -> {fun, [], [{{:., [], [{:&, [], [0]}, arg]}, [], []}]}
+      fun when is_atom(fun) -> {fun, [], []}
+      expr -> expr
+    end
   end
 
-  def app_mod(opts) do
-    opts[:app_mod] ||  maybe_camelize(opts[:app]) || Application.get_env(:qh, :app_mod) || maybe_camelize(Application.get_env(:qh, :app))
-  end
+  #
 
-  def configure(opts) do
-    Enum.each(opts, fn {k, v} ->
-      Application.put_env(:qh, k, v)
-    end)
-  end
+  def has_group_by?(%{group_bys: list}) when length(list) > 0, do: true
+  def has_group_by?(_query), do: false
 
   def default_primary_order(schema) when is_atom(schema) do
     require Ecto.Query
@@ -424,16 +449,63 @@ defmodule Qh do
     schema
   end
 
+  def split_optional_binding(params) do
+    if first_param_binding?(params) do
+      [binding | params] = params
+      {true, binding, params}
+    else
+      binding = quote do: [t]
+      {false, binding, params}
+    end
+  end
+
+  defp first_param_binding?([maybe_binding | _]), do: is_binding?(maybe_binding)
+  defp first_param_binding?(_), do: false
+
+  defp is_binding?(list) do
+    is_list(list) &&
+      Enum.all?(list, fn
+        {key, _, nil} when is_atom(key) -> true
+        {alias, {key, _, nil}} when is_atom(alias) and is_atom(key) -> true
+        _other -> false
+      end)
+  end
+
+  def repo(opts \\ []) do
+    repo_mod(opts)
+  end
+
+  def repo_mod(opts) do
+    opts[:repo] || Application.get_env(:qh, :repo) || Module.concat(app_mod(opts), Repo)
+  end
+
+  def app_mod(opts) do
+    opts[:app_mod] || maybe_camelize(opts[:app]) || Application.get_env(:qh, :app_mod) ||
+      maybe_camelize(Application.get_env(:qh, :app))
+  end
+
+  def lookup_schema(schema, opts \\ []) do
+    app_mod = app_mod(opts)
+
+    cond do
+      is_atom(schema) and first_uppercase?(schema) and ensure_compiled?(schema) ->
+        schema
+
+      first_uppercase?(schema) ->
+        module = Module.concat(app_mod, schema)
+        module_or_raise!(module, schema)
+
+      true ->
+        schema
+    end
+  end
+
   defp module_or_raise!(module, schema) do
     if ensure_compiled?(module) do
       module
     else
       raise "unable to find schema for #{inspect(schema)}, #{inspect(module)} does not exist"
     end
-  end
-
-  defp first_uppercase?(val) do
-    String.at(to_string(val), 0) == String.capitalize(String.at(to_string(val), 0))
   end
 
   defp ensure_compiled?(module) do
@@ -446,48 +518,23 @@ defmodule Qh do
     end
   end
 
+  defp first_uppercase?(val) do
+    String.at(to_string(val), 0) == String.capitalize(String.at(to_string(val), 0))
+  end
+
   defp maybe_camelize(nil), do: nil
   defp maybe_camelize(val), do: Macro.camelize(to_string(val))
 
-  defp prewalk_cond(tree, fun) do
-    apply_and_maybe_descend(tree, fun)
+
+  def unwrap_single([item]), do: item
+  def unwrap_single(other), do: other
+
+  defp unwrap_nested({{:., _, [left, right]}, opts, children}) do
+    parens = if opts[:no_parens], do: false, else: true
+
+    unwrap_nested(left) ++ [{right, [parens: parens], children}]
   end
 
-  defp do_prewalk_cond({form, meta, args}, fun) when is_atom(form) do
-    {form, meta, do_prewalk_cond_args(args, fun)}
-  end
-
-  defp do_prewalk_cond({form, meta, args}, fun) do
-    {apply_and_maybe_descend(form, fun), meta, do_prewalk_cond_args(args, fun)}
-  end
-
-  defp do_prewalk_cond({left, right}, fun) do
-    {apply_and_maybe_descend(left, fun), apply_and_maybe_descend(right, fun)}
-  end
-
-  defp do_prewalk_cond(list, fun) when is_list(list) do
-    do_prewalk_cond_args(list, fun)
-  end
-
-  defp do_prewalk_cond(x, _fun) do
-    x
-  end
-
-  defp do_prewalk_cond_args(args, _fun) when is_atom(args) do
-    args
-  end
-
-  defp do_prewalk_cond_args(args, fun) when is_list(args) do
-    Enum.map(args, fn node -> apply_and_maybe_descend(node, fun) end)
-  end
-
-  defp apply_and_maybe_descend(node, fun) do
-    case fun.(node) do
-      {true, node} ->
-        do_prewalk_cond(node, fun)
-
-      {false, node} ->
-        node
-    end
-  end
+  defp unwrap_nested({k, _, nil}), do: [k]
+  defp unwrap_nested(v), do: [v]
 end
